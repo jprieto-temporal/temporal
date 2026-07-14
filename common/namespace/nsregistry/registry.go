@@ -827,11 +827,18 @@ func (r *registry) updateSingleNamespace(ns *namespace.Namespace, updatedViaWatc
 			if updatedViaWatch {
 				// Intercept bypassed notification: if a matching on-demand update is in the deferred queue,
 				// remove it and trigger the callback immediately using the latest cached state.
-				for i, deferredNS := range r.stateChangedDuringReadthrough {
+				matched := false
+				var newQueue []*namespace.Namespace
+				for _, deferredNS := range r.stateChangedDuringReadthrough {
 					if deferredNS.ID() == ns.ID() && deferredNS.NotificationVersion() <= ns.NotificationVersion() {
-						r.stateChangedDuringReadthrough = append(r.stateChangedDuringReadthrough[:i], r.stateChangedDuringReadthrough[i+1:]...)
-						return true, curEntry
+						matched = true
+					} else {
+						newQueue = append(newQueue, deferredNS)
 					}
+				}
+				if matched {
+					r.stateChangedDuringReadthrough = newQueue
+					return true, curEntry
 				}
 			}
 			return false, nil
