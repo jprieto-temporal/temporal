@@ -1563,3 +1563,78 @@ func (s *registryWatchSuite) TestWatchProcessEventError() {
 	// Verify refresh latency metric was recorded (initial + after reconnect).
 	s.Len(snapshot[metrics.NamespaceRegistryRefreshLatency.Name()], 2)
 }
+
+// TestWatchTriggeredCallbackRecovery verifies that watch events matching an on-demand update
+// run deferred callbacks without duplicate triggers.
+func (s *registryWatchSuite) TestWatchTriggeredCallbackRecovery() {
+	nsID := namespace.NewID()
+	// Initial namespace version 1
+	nsRecordV1 := s.newGlobalNamespaceResponse(nsID, "recovery-namespace", cluster.TestCurrentClusterName, 1)
+
+	watchCh := make(chan *persistence.NamespaceWatchEvent, 3)
+	s.expectWatchAndList(watchCh, nsRecordV1)
+
+	tracker := newCallbackTracker(5)
+	s.registry.RegisterStateChangeCallback("test-recovery", tracker.callback())
+
+	s.registry.Start()
+	defer s.registry.Stop()
+
+	// 1. Initial refresh executes callback
+	s.waitForCallback(tracker.ch, "initial refresh")
+
+	ns, err := s.registry.GetNamespace("recovery-namespace")
+	s.NoError(err)
+	s.Equal(int64(1), ns.NotificationVersion())
+
+	// 2. Simulate On-Demand Update (via Read-Through)
+	// Update version to 2 and change cluster to trigger state change
+	nsRecordV2 := s.newGlobalNamespaceResponse(nsID, "recovery-namespace", cluster.TestAlternativeClusterName, 2)
+
+	s.regPersistence.EXPECT().GetNamespace(gomock.Any(), &persistence.GetNamespaceRequest{
+		ID: nsID.String(),
+	}).Return(nsRecordV2, nil)
+
+	// Read-through updates cache but defers callback
+	ns, err = s.registry.RefreshNamespaceById(nsID)
+	s.NoError(err)
+	s.Equal(int64(2), ns.NotificationVersion())
+	s.Equal(cluster.TestAlternativeClusterName, ns.ActiveClusterName(namespace.RoutingKey{}))
+
+	// Ensure no callback fired yet from the on-demand read-through
+	s.Equal(int32(1), tracker.getCount(), "callback should be deferred during read-through")
+
+	// 3. Watch Event Arrives for Version 2 (which is the same as the cached version)
+	// It should intercept the bypassed notification and run the deferred callback!
+	watchCh <- &persistence.NamespaceWatchEvent{
+		Type:     persistence.NamespaceWatchEventTypeUpdate,
+		Response: nsRecordV2,
+	}
+
+	s.waitForCallback(tracker.ch, "recovery callback")
+
+	// Callback should have fired using the recovered state
+	s.Equal(int32(2), tracker.getCount(), "callback should have fired after interception")
+
+	events := tracker.getEvents()
+	s.Len(events, 2)
+	// Verify it received the v2 state
+	s.Equal(int64(2), events[1].ns.NotificationVersion())
+	s.Equal(cluster.TestAlternativeClusterName, events[1].ns.ActiveClusterName(namespace.RoutingKey{}))
+
+	// 4. Duplicate Watch Event for Version 2 Arrives
+	// It should NOT run the callback again since the queue entry was removed!
+	watchCh <- &persistence.NamespaceWatchEvent{
+		Type:     persistence.NamespaceWatchEventTypeUpdate,
+		Response: nsRecordV2,
+	}
+
+	// Wait briefly to ensure no extra callback fires
+	select {
+	case <-tracker.ch:
+		s.FailNow("duplicate callback fired unexpectedly")
+	case <-time.After(200 * time.Millisecond):
+		// Expected
+	}
+	s.Equal(int32(2), tracker.getCount(), "no duplicate callbacks allowed")
+}
