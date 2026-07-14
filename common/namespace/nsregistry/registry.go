@@ -60,6 +60,8 @@ const (
 	startWatchMaxAttempts = 10
 	// Metrics and logs are emitted for callbacks that take longer than slowCallbackDuration
 	slowCallbackDuration = 250 * time.Millisecond
+
+	callbackQueueSize = 10000
 )
 
 var (
@@ -113,15 +115,16 @@ type (
 		refreshInterval         dynamicconfig.DurationPropertyFn
 		namespaceStateChangedFn namespace.NamespaceStateChangedFn
 
-		// nsMapsLock protects nameToID, idToNamespace, and stateChangedDuringReadthrough
+		// nsMapsLock protects nameToID and idToNamespace
 		nsMapsLock    sync.RWMutex
 		nameToID      map[namespace.Name]namespace.ID
 		idToNamespace map[namespace.ID]*namespace.Namespace
 
 		// stateChangeCallbacks is a sync.Map so that it can be used without contending for the lock protecting the cache maps; we don't
 		// need to block namespace operations while running or updating callbacks.
-		stateChangeCallbacks          sync.Map // map[any]StateChangeCallbackFn
-		stateChangedDuringReadthrough []*namespace.Namespace
+		stateChangeCallbacks sync.Map // map[any]StateChangeCallbackFn
+		callbackQueue        chan callbackEvent
+		callbackWorker       *goro.Handle
 
 		// readthroughLock protects readthroughNotFoundCache and requests to persistence
 		// it should be acquired before checking readthroughNotFoundCache, making a request
@@ -142,6 +145,11 @@ type (
 		eventCh     <-chan *persistence.NamespaceWatchEvent
 		watchCtx    context.Context
 		watchCancel context.CancelFunc
+	}
+
+	callbackEvent struct {
+		ns       *namespace.Namespace
+		isDelete bool
 	}
 )
 
@@ -171,6 +179,7 @@ func NewRegistry(
 		idToNamespace:            make(map[namespace.ID]*namespace.Namespace),
 		refreshInterval:          refreshInterval,
 		readthroughNotFoundCache: cache.New(readthroughCacheSize, &readthroughNotFoundCacheOpts),
+		callbackQueue:            make(chan callbackEvent, callbackQueueSize),
 
 		forceSearchAttributesCacheRefreshOnRead: forceSearchAttributesCacheRefreshOnRead,
 		replicationResolverFactory:              replicationResolverFactory,
@@ -204,7 +213,7 @@ func (r *registry) RefreshNamespaceById(id namespace.ID) (*namespace.Namespace, 
 	if err != nil {
 		return nil, err
 	}
-	r.updateSingleNamespace(ns, false)
+	r.updateSingleNamespace(ns)
 	return ns, nil
 }
 
@@ -219,6 +228,8 @@ func (r *registry) Start() {
 		context.Background(),
 		headers.SystemBackgroundHighCallerInfo,
 	)
+
+	r.callbackWorker = goro.NewHandle(ctx).Go(r.runCallbackWorker)
 
 	watchStarted := false
 	r.refresher, watchStarted = r.runWatchLoop(ctx)
@@ -249,6 +260,28 @@ func (r *registry) Stop() {
 	if r.refresher != nil {
 		r.refresher.Cancel()
 		<-r.refresher.Done()
+	}
+
+	if r.callbackWorker != nil {
+		r.callbackWorker.Cancel()
+		<-r.callbackWorker.Done()
+	}
+}
+
+func (r *registry) runCallbackWorker(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case event := <-r.callbackQueue:
+			r.stateChangeCallbacks.Range(
+				func(key, value any) bool {
+					//revive:disable-next-line:unchecked-type-assertion
+					cb := value.(namespace.StateChangeCallbackFn)
+					cb(event.ns, event.isDelete)
+					return true
+				})
+		}
 	}
 }
 
@@ -627,26 +660,16 @@ func (r *registry) refreshNamespaces(ctx context.Context) (err error) {
 	totalNamespaceCount := len(newIDToNamespace) // record metric value within lock boundary
 	r.idToNamespace = newIDToNamespace
 	r.nameToID = newNameToID
-	stateChanged = append(stateChanged, r.stateChangedDuringReadthrough...)
-	r.stateChangedDuringReadthrough = nil
 	r.nsMapsLock.Unlock()
 
 	metrics.TotalNamespaces.With(r.metricsHandler).Record(float64(totalNamespaceCount))
 
-	r.stateChangeCallbacks.Range(
-		func(_, value any) bool {
-			//revive:disable-next-line:unchecked-type-assertion
-			cb := value.(namespace.StateChangeCallbackFn)
-
-			for _, ns := range deletedEntries {
-				cb(ns, true)
-			}
-			for _, ns := range stateChanged {
-				cb(ns, false)
-			}
-
-			return true
-		})
+	for _, ns := range deletedEntries {
+		r.callbackQueue <- callbackEvent{ns: ns, isDelete: true}
+	}
+	for _, ns := range stateChanged {
+		r.callbackQueue <- callbackEvent{ns: ns, isDelete: false}
+	}
 
 	return nil
 }
@@ -654,14 +677,10 @@ func (r *registry) refreshNamespaces(ctx context.Context) (err error) {
 // processWatchEvent handles a single namespace watch event by updating the cache
 // and invoking state change callbacks.
 func (r *registry) processWatchEvent(event *persistence.NamespaceWatchEvent) error {
-	var executeCallbacks bool
-	var ns *namespace.Namespace
-
 	switch event.Type {
 	case persistence.NamespaceWatchEventTypeCreate, persistence.NamespaceWatchEventTypeUpdate:
 		// event.Response is assumed non-nil here; persistence implementations must ensure this.
-		var err error
-		ns, err = namespace.FromPersistentState(
+		ns, err := namespace.FromPersistentState(
 			event.Response.Namespace,
 			r.replicationResolverFactory(event.Response.Namespace),
 			namespace.WithGlobalFlag(event.Response.IsGlobalNamespace),
@@ -670,10 +689,9 @@ func (r *registry) processWatchEvent(event *persistence.NamespaceWatchEvent) err
 		if err != nil {
 			return err
 		}
-		executeCallbacks = r.updateSingleNamespace(ns, true)
+		r.updateSingleNamespace(ns)
 	case persistence.NamespaceWatchEventTypeDelete:
-		ns = r.deleteNamespace(event.NamespaceID)
-		executeCallbacks = ns != nil
+		r.deleteNamespace(event.NamespaceID)
 	default:
 		r.logger.Warn("Unknown namespace watch event type", tag.Int("eventType", int(event.Type)))
 	}
@@ -681,31 +699,27 @@ func (r *registry) processWatchEvent(event *persistence.NamespaceWatchEvent) err
 	idCount, _ := r.GetRegistrySize()
 	metrics.TotalNamespaces.With(r.metricsHandler).Record(float64(idCount))
 
-	if executeCallbacks {
-		isDelete := event.Type == persistence.NamespaceWatchEventTypeDelete
-
-		r.stateChangeCallbacks.Range(
-			func(key, value any) bool {
-				//revive:disable-next-line:unchecked-type-assertion
-				cb := value.(namespace.StateChangeCallbackFn)
-				cb(ns, isDelete)
-				return true
-			})
-	}
-
 	return nil
 }
 
 // deleteNamespace removes a namespace from the cache and returns the deleted namespace if it existed
 func (r *registry) deleteNamespace(id namespace.ID) *namespace.Namespace {
-	r.nsMapsLock.Lock()
-	defer r.nsMapsLock.Unlock()
-	ns, exists := r.idToNamespace[id]
-	if !exists {
-		return nil
+	var ns *namespace.Namespace
+	func() {
+		r.nsMapsLock.Lock()
+		defer r.nsMapsLock.Unlock()
+		var exists bool
+		ns, exists = r.idToNamespace[id]
+		if !exists {
+			return
+		}
+		delete(r.idToNamespace, id)
+		delete(r.nameToID, ns.Name())
+	}()
+	
+	if ns != nil {
+		r.callbackQueue <- callbackEvent{ns: ns, isDelete: true}
 	}
-	delete(r.idToNamespace, id)
-	delete(r.nameToID, ns.Name())
 	return ns
 }
 
@@ -773,7 +787,7 @@ func (r *registry) getOrReadthroughNamespace(name namespace.Name) (*namespace.Na
 	}
 
 	// update main entry if found
-	r.updateSingleNamespace(ns, false)
+	r.updateSingleNamespace(ns)
 
 	return ns, nil
 }
@@ -808,36 +822,38 @@ func (r *registry) getOrReadthroughNamespaceByID(id namespace.ID) (*namespace.Na
 	}
 
 	// update main entry if found
-	r.updateSingleNamespace(ns, false)
+	r.updateSingleNamespace(ns)
 
 	return ns, nil
 }
 
 // updateSingleNamespace updates the cache with a namespace if it's newer than what we have.
 // Returns true if the namespace state changed.
-// When updatedViaWatch is true, we skip adding to stateChangedDuringReadthrough since watch events
-// trigger callbacks immediately and don't need to be queued for later delivery.
-func (r *registry) updateSingleNamespace(ns *namespace.Namespace, updatedViaWatch bool) bool {
-	r.nsMapsLock.Lock()
-	defer r.nsMapsLock.Unlock()
+func (r *registry) updateSingleNamespace(ns *namespace.Namespace) bool {
+	changed := false
+	func() {
+		r.nsMapsLock.Lock()
+		defer r.nsMapsLock.Unlock()
 
-	if curEntry, ok := r.idToNamespace[ns.ID()]; ok {
-		if curEntry.NotificationVersion() >= ns.NotificationVersion() {
-			// More up-to-date version already stored
-			return false
+		if curEntry, ok := r.idToNamespace[ns.ID()]; ok {
+			if curEntry.NotificationVersion() >= ns.NotificationVersion() {
+				// More up-to-date version already stored
+				return
+			}
 		}
-	}
 
-	oldNS := r.updateIDToNamespace(r.idToNamespace, ns.ID(), ns)
-	// If namespace was renamed, remove entry for the old name
-	if oldNS != nil && oldNS.Name() != ns.Name() {
-		delete(r.nameToID, oldNS.Name())
-	}
-	r.nameToID[ns.Name()] = ns.ID()
+		oldNS := r.updateIDToNamespace(r.idToNamespace, ns.ID(), ns)
+		// If namespace was renamed, remove entry for the old name
+		if oldNS != nil && oldNS.Name() != ns.Name() {
+			delete(r.nameToID, oldNS.Name())
+		}
+		r.nameToID[ns.Name()] = ns.ID()
 
-	changed := r.namespaceStateChanged(oldNS, ns)
-	if changed && !updatedViaWatch {
-		r.stateChangedDuringReadthrough = append(r.stateChangedDuringReadthrough, ns)
+		changed = r.namespaceStateChanged(oldNS, ns)
+	}()
+
+	if changed {
+		r.callbackQueue <- callbackEvent{ns: ns, isDelete: false}
 	}
 
 	return changed

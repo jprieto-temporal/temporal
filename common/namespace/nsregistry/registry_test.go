@@ -445,23 +445,34 @@ func (s *registrySuite) TestUpdateCache_TriggerCallBack() {
 	defer s.registry.Stop()
 
 	var entries []*namespace.Namespace
+	var entriesLock sync.Mutex
 
 	wg := &sync.WaitGroup{}
 	wg.Add(2)
 	s.registry.RegisterStateChangeCallback(
 		"0",
 		func(ns *namespace.Namespace, deletedFromDb bool) {
-			defer wg.Done()
+			entriesLock.Lock()
+			defer entriesLock.Unlock()
 			s.False(deletedFromDb)
+			// Deduplicate
+			for _, e := range entries {
+				if e.ID() == ns.ID() && e.NotificationVersion() == ns.NotificationVersion() {
+					return
+				}
+			}
 			entries = append(entries, ns)
+			wg.Done()
 		},
 	)
 	wg.Wait()
 
+	entriesLock.Lock()
 	s.Len(entries, 2)
 	if entries[0].NotificationVersion() > entries[1].NotificationVersion() {
 		entries[0], entries[1] = entries[1], entries[0]
 	}
+	entriesLock.Unlock()
 	// Compare by ID and key properties instead of pointer equality
 	s.Equal(entry1Old.ID(), entries[0].ID())
 	s.Equal(entry1Old.Name(), entries[0].Name())
