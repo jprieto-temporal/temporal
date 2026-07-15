@@ -670,7 +670,7 @@ func (r *registry) processWatchEvent(event *persistence.NamespaceWatchEvent) err
 		if err != nil {
 			return err
 		}
-		executeCallbacks = r.updateSingleNamespace(ns, true)
+		executeCallbacks, ns = r.updateSingleNamespace(ns, true)
 	case persistence.NamespaceWatchEventTypeDelete:
 		ns = r.deleteNamespace(event.NamespaceID)
 		executeCallbacks = ns != nil
@@ -814,17 +814,36 @@ func (r *registry) getOrReadthroughNamespaceByID(id namespace.ID) (*namespace.Na
 }
 
 // updateSingleNamespace updates the cache with a namespace if it's newer than what we have.
-// Returns true if the namespace state changed.
+// Returns true if the namespace state changed, along with the namespace to use for callbacks.
 // When updatedViaWatch is true, we skip adding to stateChangedDuringReadthrough since watch events
 // trigger callbacks immediately and don't need to be queued for later delivery.
-func (r *registry) updateSingleNamespace(ns *namespace.Namespace, updatedViaWatch bool) bool {
+func (r *registry) updateSingleNamespace(ns *namespace.Namespace, updatedViaWatch bool) (bool, *namespace.Namespace) {
 	r.nsMapsLock.Lock()
 	defer r.nsMapsLock.Unlock()
+
+	matchedDeferred := false
+	if updatedViaWatch {
+		var newQueue []*namespace.Namespace
+		for _, deferredNS := range r.stateChangedDuringReadthrough {
+			if deferredNS.ID() == ns.ID() {
+				matchedDeferred = true
+			} else {
+				newQueue = append(newQueue, deferredNS)
+			}
+		}
+		if matchedDeferred {
+			r.stateChangedDuringReadthrough = newQueue
+		}
+	}
 
 	if curEntry, ok := r.idToNamespace[ns.ID()]; ok {
 		if curEntry.NotificationVersion() >= ns.NotificationVersion() {
 			// More up-to-date version already stored
-			return false
+			if updatedViaWatch && matchedDeferred {
+				// Intercept bypassed notification: trigger the callback immediately using the latest cached state.
+				return true, curEntry
+			}
+			return false, nil
 		}
 	}
 
@@ -836,11 +855,14 @@ func (r *registry) updateSingleNamespace(ns *namespace.Namespace, updatedViaWatc
 	r.nameToID[ns.Name()] = ns.ID()
 
 	changed := r.namespaceStateChanged(oldNS, ns)
+	if matchedDeferred {
+		changed = true
+	}
 	if changed && !updatedViaWatch {
 		r.stateChangedDuringReadthrough = append(r.stateChangedDuringReadthrough, ns)
 	}
 
-	return changed
+	return changed, ns
 }
 
 func (r *registry) getNamespaceByNamePersistence(name namespace.Name) (*namespace.Namespace, error) {
