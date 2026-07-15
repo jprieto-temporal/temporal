@@ -40,12 +40,24 @@ jobs:
       head_sha: ${{ steps.resolve.outputs.head_sha }}
       pr_number: ${{ steps.resolve.outputs.pr_number }}
     steps:
+      - name: Check secrets
+        id: check_secrets
+        env:
+          APP_ID: ${{ secrets.TEMPORAL_CICD_APP_ID }}
+        run: |
+          if [ -z "$APP_ID" ]; then
+            echo "TEMPORAL_CICD_APP_ID is not set. Skipping review."
+            echo "has_secret=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_secret=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Generate app token
         id: generate_token
+        if: steps.check_secrets.outputs.has_secret == 'true'
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
-          app-id: ${{ secrets.TEMPORAL_AI_REVIEW_APP_ID }}
-          private-key: ${{ secrets.TEMPORAL_AI_REVIEW_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.TEMPORAL_CICD_APP_ID }}
+          private-key: ${{ secrets.TEMPORAL_CICD_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           # Least-privilege: members:read for team-membership lookups,
           # pull-requests:read for PR metadata, and
@@ -54,6 +66,7 @@ jobs:
           permission-pull-requests: read
           permission-issues: read
       - id: resolve
+        if: steps.check_secrets.outputs.has_secret == 'true'
         env:
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
@@ -72,6 +85,7 @@ jobs:
             echo "head_sha=${head_sha}"
           } >> "$GITHUB_OUTPUT"
       - id: decision
+        if: steps.check_secrets.outputs.has_secret == 'true'
         env:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
           AUTHOR: ${{ steps.resolve.outputs.author }}
