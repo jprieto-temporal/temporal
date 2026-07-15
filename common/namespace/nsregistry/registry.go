@@ -716,7 +716,7 @@ func (r *registry) deleteNamespace(id namespace.ID) *namespace.Namespace {
 		delete(r.idToNamespace, id)
 		delete(r.nameToID, ns.Name())
 	}()
-	
+
 	if ns != nil {
 		r.callbackQueue <- callbackEvent{ns: ns, isDelete: true}
 	}
