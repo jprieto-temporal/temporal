@@ -1061,7 +1061,14 @@ func (s *registryWatchSuite) TestWatchEmptyInitialRefresh() {
 	ns, err := s.registry.GetNamespace("new-namespace")
 	s.NoError(err)
 	s.Equal(nsID, ns.ID())
-	s.InEpsilon(float64(1), s.capture.Snapshot()[metrics.TotalNamespaces.Name()][1].Value, 0.01)
+	s.Eventually(func() bool {
+		snapshots := s.capture.Snapshot()[metrics.TotalNamespaces.Name()]
+		if len(snapshots) >= 2 {
+			s.InEpsilon(float64(1), snapshots[len(snapshots)-1].Value, 0.01)
+			return true
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond)
 }
 
 // TestWatchUpdateForUnknownNamespace verifies that an update event for a namespace

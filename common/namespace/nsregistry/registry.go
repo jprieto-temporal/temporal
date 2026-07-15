@@ -213,7 +213,9 @@ func (r *registry) RefreshNamespaceById(id namespace.ID) (*namespace.Namespace, 
 	if err != nil {
 		return nil, err
 	}
-	r.updateSingleNamespace(ns)
+	if r.updateSingleNamespace(ns) {
+		r.callbackQueue <- callbackEvent{ns: ns, isDelete: false}
+	}
 	return ns, nil
 }
 
@@ -677,6 +679,9 @@ func (r *registry) refreshNamespaces(ctx context.Context) (err error) {
 // processWatchEvent handles a single namespace watch event by updating the cache
 // and invoking state change callbacks.
 func (r *registry) processWatchEvent(event *persistence.NamespaceWatchEvent) error {
+	var changedNS *namespace.Namespace
+	var isDelete bool
+
 	switch event.Type {
 	case persistence.NamespaceWatchEventTypeCreate, persistence.NamespaceWatchEventTypeUpdate:
 		// event.Response is assumed non-nil here; persistence implementations must ensure this.
@@ -689,9 +694,15 @@ func (r *registry) processWatchEvent(event *persistence.NamespaceWatchEvent) err
 		if err != nil {
 			return err
 		}
-		r.updateSingleNamespace(ns)
+		if r.updateSingleNamespace(ns) {
+			changedNS = ns
+			isDelete = false
+		}
 	case persistence.NamespaceWatchEventTypeDelete:
-		r.deleteNamespace(event.NamespaceID)
+		if ns := r.deleteNamespace(event.NamespaceID); ns != nil {
+			changedNS = ns
+			isDelete = true
+		}
 	default:
 		r.logger.Warn("Unknown namespace watch event type", tag.Int("eventType", int(event.Type)))
 	}
@@ -699,27 +710,23 @@ func (r *registry) processWatchEvent(event *persistence.NamespaceWatchEvent) err
 	idCount, _ := r.GetRegistrySize()
 	metrics.TotalNamespaces.With(r.metricsHandler).Record(float64(idCount))
 
+	if changedNS != nil {
+		r.callbackQueue <- callbackEvent{ns: changedNS, isDelete: isDelete}
+	}
+
 	return nil
 }
 
 // deleteNamespace removes a namespace from the cache and returns the deleted namespace if it existed
 func (r *registry) deleteNamespace(id namespace.ID) *namespace.Namespace {
-	var ns *namespace.Namespace
-	func() {
-		r.nsMapsLock.Lock()
-		defer r.nsMapsLock.Unlock()
-		var exists bool
-		ns, exists = r.idToNamespace[id]
-		if !exists {
-			return
-		}
-		delete(r.idToNamespace, id)
-		delete(r.nameToID, ns.Name())
-	}()
-
-	if ns != nil {
-		r.callbackQueue <- callbackEvent{ns: ns, isDelete: true}
+	r.nsMapsLock.Lock()
+	defer r.nsMapsLock.Unlock()
+	ns, exists := r.idToNamespace[id]
+	if !exists {
+		return nil
 	}
+	delete(r.idToNamespace, id)
+	delete(r.nameToID, ns.Name())
 	return ns
 }
 
@@ -787,7 +794,9 @@ func (r *registry) getOrReadthroughNamespace(name namespace.Name) (*namespace.Na
 	}
 
 	// update main entry if found
-	r.updateSingleNamespace(ns)
+	if r.updateSingleNamespace(ns) {
+		r.callbackQueue <- callbackEvent{ns: ns, isDelete: false}
+	}
 
 	return ns, nil
 }
@@ -822,7 +831,9 @@ func (r *registry) getOrReadthroughNamespaceByID(id namespace.ID) (*namespace.Na
 	}
 
 	// update main entry if found
-	r.updateSingleNamespace(ns)
+	if r.updateSingleNamespace(ns) {
+		r.callbackQueue <- callbackEvent{ns: ns, isDelete: false}
+	}
 
 	return ns, nil
 }
@@ -830,33 +841,24 @@ func (r *registry) getOrReadthroughNamespaceByID(id namespace.ID) (*namespace.Na
 // updateSingleNamespace updates the cache with a namespace if it's newer than what we have.
 // Returns true if the namespace state changed.
 func (r *registry) updateSingleNamespace(ns *namespace.Namespace) bool {
-	changed := false
-	func() {
-		r.nsMapsLock.Lock()
-		defer r.nsMapsLock.Unlock()
+	r.nsMapsLock.Lock()
+	defer r.nsMapsLock.Unlock()
 
-		if curEntry, ok := r.idToNamespace[ns.ID()]; ok {
-			if curEntry.NotificationVersion() >= ns.NotificationVersion() {
-				// More up-to-date version already stored
-				return
-			}
+	if curEntry, ok := r.idToNamespace[ns.ID()]; ok {
+		if curEntry.NotificationVersion() >= ns.NotificationVersion() {
+			// More up-to-date version already stored
+			return false
 		}
-
-		oldNS := r.updateIDToNamespace(r.idToNamespace, ns.ID(), ns)
-		// If namespace was renamed, remove entry for the old name
-		if oldNS != nil && oldNS.Name() != ns.Name() {
-			delete(r.nameToID, oldNS.Name())
-		}
-		r.nameToID[ns.Name()] = ns.ID()
-
-		changed = r.namespaceStateChanged(oldNS, ns)
-	}()
-
-	if changed {
-		r.callbackQueue <- callbackEvent{ns: ns, isDelete: false}
 	}
 
-	return changed
+	oldNS := r.updateIDToNamespace(r.idToNamespace, ns.ID(), ns)
+	// If namespace was renamed, remove entry for the old name
+	if oldNS != nil && oldNS.Name() != ns.Name() {
+		delete(r.nameToID, oldNS.Name())
+	}
+	r.nameToID[ns.Name()] = ns.ID()
+
+	return r.namespaceStateChanged(oldNS, ns)
 }
 
 func (r *registry) getNamespaceByNamePersistence(name namespace.Name) (*namespace.Namespace, error) {
