@@ -821,25 +821,27 @@ func (r *registry) updateSingleNamespace(ns *namespace.Namespace, updatedViaWatc
 	r.nsMapsLock.Lock()
 	defer r.nsMapsLock.Unlock()
 
+	matchedDeferred := false
+	if updatedViaWatch {
+		var newQueue []*namespace.Namespace
+		for _, deferredNS := range r.stateChangedDuringReadthrough {
+			if deferredNS.ID() == ns.ID() {
+				matchedDeferred = true
+			} else {
+				newQueue = append(newQueue, deferredNS)
+			}
+		}
+		if matchedDeferred {
+			r.stateChangedDuringReadthrough = newQueue
+		}
+	}
+
 	if curEntry, ok := r.idToNamespace[ns.ID()]; ok {
 		if curEntry.NotificationVersion() >= ns.NotificationVersion() {
 			// More up-to-date version already stored
-			if updatedViaWatch {
-				// Intercept bypassed notification: if a matching on-demand update is in the deferred queue,
-				// remove it and trigger the callback immediately using the latest cached state.
-				matched := false
-				var newQueue []*namespace.Namespace
-				for _, deferredNS := range r.stateChangedDuringReadthrough {
-					if deferredNS.ID() == ns.ID() && deferredNS.NotificationVersion() <= ns.NotificationVersion() {
-						matched = true
-					} else {
-						newQueue = append(newQueue, deferredNS)
-					}
-				}
-				if matched {
-					r.stateChangedDuringReadthrough = newQueue
-					return true, curEntry
-				}
+			if updatedViaWatch && matchedDeferred {
+				// Intercept bypassed notification: trigger the callback immediately using the latest cached state.
+				return true, curEntry
 			}
 			return false, nil
 		}
@@ -853,6 +855,9 @@ func (r *registry) updateSingleNamespace(ns *namespace.Namespace, updatedViaWatc
 	r.nameToID[ns.Name()] = ns.ID()
 
 	changed := r.namespaceStateChanged(oldNS, ns)
+	if matchedDeferred {
+		changed = true
+	}
 	if changed && !updatedViaWatch {
 		r.stateChangedDuringReadthrough = append(r.stateChangedDuringReadthrough, ns)
 	}
